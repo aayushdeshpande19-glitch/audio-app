@@ -81,6 +81,7 @@ class LibraryController extends ChangeNotifier {
         try {
           var known = await db.fingerprints(folder.uri);
           var first = true;
+          var lastProgressUpdate = DateTime.now();
           while (true) {
             final page = await access.scanPage(
               folder.uri,
@@ -91,13 +92,19 @@ class LibraryController extends ChangeNotifier {
             if (page.isEmpty) break;
             await db.ingest(folder.uri, token, page);
             scanned += page.length;
-            changed();
+            final now = DateTime.now();
+            if (now.difference(lastProgressUpdate).inMilliseconds >= 250) {
+              lastProgressUpdate = now;
+              notifyListeners();
+            }
           }
           await db.finishScan(folder.uri, token);
+          changed();
         } catch (e) {
           error =
               'Could not read ${folder.name}. Select the folder again to restore access.';
           await db.failScan(folder.uri, error!);
+          changed();
         }
       }
     } catch (e) {

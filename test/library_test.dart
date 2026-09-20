@@ -60,7 +60,7 @@ void main() {
       await db.finishScan('a', '1');
       final track = (await db.songs(query: '%_')).single;
       expect(track.id, 'one');
-      expect(db.schemaVersion, 1);
+      expect(db.schemaVersion, 2);
       await db.favorite(track);
       await db.ingest('a', '2', [song('one', title: 'Retagged', modified: 2)]);
       await db.finishScan('a', '2');
@@ -220,4 +220,22 @@ void main() {
       '20k database fixture: ingest ${importMs}ms; search + groups + full listing + restore ${watch.elapsedMilliseconds}ms',
     );
   }, timeout: const Timeout(Duration(minutes: 2)));
+
+  test('schema version 2 includes track_added index', () async {
+    expect(db.schemaVersion, 2);
+    final rows = await db.rows(
+      "SELECT name FROM sqlite_master WHERE type='index' AND name='track_added'",
+    );
+    expect(rows, isNotEmpty);
+    expect(rows.single['name'], 'track_added');
+  });
+
+  test('playback position and current track scalar settings update correctly', () async {
+    await db.putSetting('playback_position', 45000);
+    await db.putSetting('playback_current', 'track-123');
+    final pos = await db.setting('playback_position');
+    final current = await db.setting('playback_current');
+    expect(pos, 45000);
+    expect(current, 'track-123');
+  });
 }

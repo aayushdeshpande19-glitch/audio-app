@@ -18,7 +18,7 @@ class LibraryDatabase extends GeneratedDatabase {
   }
 
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 2;
   @override
   Iterable<TableInfo<Table, Object?>> get allTables => const [];
   @override
@@ -28,6 +28,13 @@ class LibraryDatabase extends GeneratedDatabase {
     onCreate: (_) async {
       for (final statement in _schema) {
         await customStatement(statement);
+      }
+    },
+    onUpgrade: (m, from, to) async {
+      if (from < 2) {
+        await customStatement(
+          'CREATE INDEX IF NOT EXISTS track_added ON tracks(added_at DESC)',
+        );
       }
     },
     beforeOpen: (_) async {
@@ -50,6 +57,7 @@ class LibraryDatabase extends GeneratedDatabase {
     'CREATE INDEX track_artist ON tracks(artist COLLATE NOCASE)',
     'CREATE INDEX track_album ON tracks(album, album_artist)',
     'CREATE INDEX track_recent ON tracks(last_played DESC)',
+    'CREATE INDEX track_added ON tracks(added_at DESC)',
     'CREATE INDEX folder_track_id ON folder_tracks(track_id)',
     '''CREATE TABLE playlists(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)''',
     '''CREATE TABLE playlist_tracks(playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,

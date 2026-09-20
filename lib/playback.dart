@@ -52,7 +52,7 @@ class LocalAudioHandler extends BaseAudioHandler
     });
     _saveTimer = Timer.periodic(
       const Duration(seconds: 5),
-      (_) => _scheduleSave(),
+      (_) => unawaited(_savePosition()),
     );
   }
   final LibraryDatabase db;
@@ -62,12 +62,39 @@ class LocalAudioHandler extends BaseAudioHandler
   List<Track> get tracks => List.unmodifiable(_tracks);
   AudioPlayer get player => _player;
   Timer? _saveTimer, _saveDebounce;
+  StreamSubscription<void>? _noisySubscription;
+  StreamSubscription<AudioInterruptionEvent>? _interruptionSubscription;
   Future<void> _operations = Future.value();
   bool _loading = false;
   String? _lastPlayed;
   Future<void> configure() async {
     final session = await AudioSession.instance;
     await session.configure(const AudioSessionConfiguration.music());
+    await _noisySubscription?.cancel();
+    _noisySubscription = session.becomingNoisyEventStream.listen((_) {
+      pause();
+    });
+    await _interruptionSubscription?.cancel();
+    _interruptionSubscription = session.interruptionEventStream.listen((event) {
+      if (event.begin) {
+        switch (event.type) {
+          case AudioInterruptionType.duck:
+            _player.setVolume(0.2);
+          case AudioInterruptionType.pause:
+          case AudioInterruptionType.unknown:
+            pause();
+        }
+      } else {
+        switch (event.type) {
+          case AudioInterruptionType.duck:
+            _player.setVolume(1.0);
+          case AudioInterruptionType.pause:
+            play();
+          case AudioInterruptionType.unknown:
+            break;
+        }
+      }
+    });
   }
 
   Future<void> _serial(Future<void> Function() operation) {
@@ -89,7 +116,14 @@ class LocalAudioHandler extends BaseAudioHandler
     extras: {'uri': t.uri, 'art': t.artPath},
   );
   void _publishQueue() {
-    queue.add(_tracks.map(_item).toList());
+    if (_tracks.length <= 100) {
+      queue.add(_tracks.map(_item).toList());
+      return;
+    }
+    final cur = (_player.currentIndex ?? 0).clamp(0, _tracks.length - 1);
+    final start = (cur - 20).clamp(0, _tracks.length);
+    final end = (cur + 80).clamp(0, _tracks.length);
+    queue.add(_tracks.sublist(start, end).map(_item).toList());
   }
 
   AudioSource _source(Track t) =>
@@ -137,7 +171,11 @@ class LocalAudioHandler extends BaseAudioHandler
       final ids = List<String>.from(saved['ids'] as List);
       final tracks = await db.tracksByIds(ids);
       if (tracks.isEmpty) return;
-      final current = saved['current'] as String?;
+      final savedCur = await db.setting('playback_current');
+      final current = (savedCur as String?) ?? (saved['current'] as String?);
+      final savedPos = await db.setting('playback_position');
+      final positionMs =
+          (savedPos as num?)?.toInt() ?? (saved['position'] as num?)?.toInt() ?? 0;
       final originalIndex = (saved['index'] as int? ?? 0).clamp(0, ids.length - 1);
       final availableIds = tracks.map((t) => t.id).toSet();
       var index = ids.take(originalIndex).where(availableIds.contains).length;
@@ -149,7 +187,7 @@ class LocalAudioHandler extends BaseAudioHandler
         tracks,
         index,
         tracks[index].id == current
-            ? Duration(milliseconds: (saved['position'] as int?) ?? 0)
+            ? Duration(milliseconds: positionMs)
             : Duration.zero,
       );
       await _player.setLoopMode(
@@ -178,6 +216,9 @@ class LocalAudioHandler extends BaseAudioHandler
         mediaItem.add(_item(track).copyWith(artUri: Uri.file(path)));
       }
     });
+    if (_tracks.length > 100) {
+      _publishQueue();
+    }
     _recordPlayed();
     _broadcast();
     _scheduleSave();
@@ -240,13 +281,29 @@ class LocalAudioHandler extends BaseAudioHandler
     );
   }
 
+  Future<void> _savePosition() async {
+    if (_loading || !_player.playing) return;
+    final pos = _player.position.inMilliseconds;
+    await db.putSetting('playback_position', pos);
+    final id = mediaItem.value?.id;
+    if (id != null) {
+      await db.putSetting('playback_current', id);
+    }
+  }
+
   Future<void> save() async {
     if (_loading) return;
+    final pos = _player.position.inMilliseconds;
+    final cur = mediaItem.value?.id;
+    await db.putSetting('playback_position', pos);
+    if (cur != null) {
+      await db.putSetting('playback_current', cur);
+    }
     await db.putSetting('playback', {
       'ids': _tracks.map((t) => t.id).toList(),
-      'current': mediaItem.value?.id,
+      'current': cur,
       'index': _player.currentIndex,
-      'position': _player.position.inMilliseconds,
+      'position': pos,
       'repeat': _player.loopMode.index,
       'shuffle': _player.shuffleModeEnabled,
     });
@@ -375,6 +432,8 @@ class LocalAudioHandler extends BaseAudioHandler
   Future<void> dispose() async {
     _saveTimer?.cancel();
     _saveDebounce?.cancel();
+    await _noisySubscription?.cancel();
+    await _interruptionSubscription?.cancel();
     await save();
     await _player.dispose();
     await messages.close();

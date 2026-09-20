@@ -585,45 +585,44 @@ class EmptyLibrary extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) => Center(
     child: SingleChildScrollView(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 12),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 76,
-              height: 76,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: surface,
-                border: Border.all(color: const Color(0xFF344330), width: 7),
-              ),
-              child: const Icon(Icons.album_outlined, color: green, size: 36),
+      physics: const BouncingScrollPhysics(),
+      padding: const EdgeInsets.fromLTRB(28, 16, 28, 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 72,
+            height: 72,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: surface,
+              border: Border.all(color: const Color(0xFF344330), width: 6),
             ),
-            const SizedBox(height: 14),
-            Text(
-              title,
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
+            child: const Icon(Icons.album_outlined, color: green, size: 34),
+          ),
+          const SizedBox(height: 14),
+          Text(
+            title,
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            body,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white54, height: 1.5),
+          ),
+          if (import) ...[
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: ref.watch(libraryProvider).scanning
+                  ? null
+                  : () => ref.read(libraryProvider).addFolder(),
+              icon: const Icon(Icons.create_new_folder_outlined),
+              label: const Text('Choose music folder'),
             ),
-            const SizedBox(height: 8),
-            Text(
-              body,
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white54, height: 1.5),
-            ),
-            if (import) ...[
-              const SizedBox(height: 16),
-              FilledButton.icon(
-                onPressed: ref.watch(libraryProvider).scanning
-                    ? null
-                    : () => ref.read(libraryProvider).addFolder(),
-                icon: const Icon(Icons.create_new_folder_outlined),
-                label: const Text('Choose music folder'),
-              ),
-            ],
           ],
-        ),
+        ],
       ),
     ),
   );
@@ -677,8 +676,10 @@ class SongResults extends ConsumerWidget {
                 ),
                 TextButton.icon(
                   onPressed: () async {
+                    if (tracks.isEmpty) return;
                     final audio = ref.read(audioProvider);
-                    await audio.playTracks(tracks);
+                    final startIndex = Random().nextInt(tracks.length);
+                    await audio.playTracks(tracks, index: startIndex);
                     await audio.setShuffleMode(AudioServiceShuffleMode.all);
                   },
                   icon: const Icon(Icons.shuffle, size: 18),
@@ -1544,7 +1545,9 @@ class _SeekBarState extends State<SeekBar> {
   Widget build(BuildContext context) => StreamBuilder<Duration>(
     stream: widget.audio.player.positionStream,
     builder: (context, s) {
-      final max = (widget.audio.player.duration?.inMilliseconds ?? 0)
+      final max = (widget.audio.player.duration?.inMilliseconds ??
+              widget.audio.mediaItem.value?.duration?.inMilliseconds ??
+              0)
           .toDouble();
       final current = (drag ?? (s.data?.inMilliseconds ?? 0).toDouble()).clamp(
         0.0,

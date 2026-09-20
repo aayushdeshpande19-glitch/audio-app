@@ -101,8 +101,16 @@ class MainActivity : AudioServiceActivity() {
             val dir = directories.removeFirst()
             if (!visited.add(dir)) continue
             val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, dir)
-            val cursor = contentResolver.query(children, columns, null, null, null)
-                ?: throw IllegalStateException("Folder is unavailable")
+            val cursor = try {
+                contentResolver.query(children, columns, null, null, null)
+            } catch (e: Exception) {
+                if (visited.size == 1) throw IllegalStateException("Folder is unavailable", e)
+                null
+            }
+            if (cursor == null) {
+                if (visited.size == 1) throw IllegalStateException("Folder is unavailable")
+                continue
+            }
             cursor.use {
                 // Close each directory cursor before yielding any metadata work.
                 val files = mutableListOf<Array<Any>>()
