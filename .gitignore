@@ -1,0 +1,16 @@
+.dart_tool/
+.flutter-plugins*
+.packages
+build/
+.tooling/
+.gradle/
+.pub-cache/
+android/local.properties
+android/key.properties
+android/.gradle/
+android/app/localbeat-release.jks
+*.iml
+.idea/
+.DS_Store
+test-output/
+
