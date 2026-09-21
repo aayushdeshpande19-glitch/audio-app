@@ -41,6 +41,9 @@ dependencies:
   sqlite3: ^2.9.0
   sqlite3_flutter_libs: ^0.5.39
   path_provider: ^2.1.5
+  google_sign_in: ^6.2.2
+  googleapis: ^13.2.0
+  http: ^1.2.1
 
 dev_dependencies:
   integration_test:

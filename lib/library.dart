@@ -2,6 +2,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
 
 import 'database.dart';
+import 'drive_service.dart';
 import 'playback.dart';
 
 /// Platform boundary: a desktop implementation can replace this adapter later.
@@ -41,13 +42,15 @@ class AndroidLibraryAccess implements LibraryAccess {
 }
 
 class LibraryController extends ChangeNotifier {
-  LibraryController(this.db, this.access);
+  LibraryController(this.db, this.access, {this.driveService});
   final LibraryDatabase db;
   final LibraryAccess access;
+  final DriveService? driveService;
   bool scanning = false;
   int scanned = 0, revision = 0;
   String? error;
   String? currentFolder;
+  String? currentDriveFolder;
   void changed() {
     revision++;
     notifyListeners();
@@ -124,6 +127,54 @@ class LibraryController extends ChangeNotifier {
     } catch (_) {
       /* Already revoked by Android. */
     }
+    changed();
+  }
+
+  Future<void> syncDriveFolder(String folderId, String folderName) async {
+    if (scanning || driveService == null) return;
+    scanning = true;
+    currentFolder = 'Google Drive: $folderName';
+    currentDriveFolder = folderName;
+    scanned = 0;
+    error = null;
+    notifyListeners();
+
+    try {
+      final token = DateTime.now().microsecondsSinceEpoch.toString();
+      final audioFiles = await driveService!.scanFolder(
+        folderId,
+        folderName: folderName,
+        onProgress: (count) {
+          scanned = count;
+          notifyListeners();
+        },
+      );
+
+      final trackMaps = audioFiles.map((f) => f.toTrackMap()).toList();
+      await db.ingestDriveTracks(folderId, token, trackMaps);
+      await db.putSetting('gdrive_sync', {
+        'folder_id': folderId,
+        'folder_name': folderName,
+        'synced_at': DateTime.now().millisecondsSinceEpoch,
+        'count': trackMaps.length,
+      });
+      scanned = trackMaps.length;
+      changed();
+    } catch (e) {
+      error = 'Could not sync Google Drive folder: $e';
+      notifyListeners();
+    } finally {
+      scanning = false;
+      currentFolder = null;
+      changed();
+    }
+  }
+
+  Future<void> clearDriveLibrary() async {
+    if (scanning) return;
+    await db.clearDriveTracks();
+    await db.putSetting('gdrive_sync', {});
+    currentDriveFolder = null;
     changed();
   }
 }

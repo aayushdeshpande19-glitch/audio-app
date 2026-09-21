@@ -60,7 +60,7 @@ void main() {
       await db.finishScan('a', '1');
       final track = (await db.songs(query: '%_')).single;
       expect(track.id, 'one');
-      expect(db.schemaVersion, 2);
+      expect(db.schemaVersion, 3);
       await db.favorite(track);
       await db.ingest('a', '2', [song('one', title: 'Retagged', modified: 2)]);
       await db.finishScan('a', '2');
@@ -221,13 +221,60 @@ void main() {
     );
   }, timeout: const Timeout(Duration(minutes: 2)));
 
-  test('schema version 2 includes track_added index', () async {
-    expect(db.schemaVersion, 2);
+  test('schema version 3 includes track_added and track_downloaded index', () async {
+    expect(db.schemaVersion, 3);
     final rows = await db.rows(
-      "SELECT name FROM sqlite_master WHERE type='index' AND name='track_added'",
+      "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('track_added', 'track_downloaded', 'track_source')",
     );
-    expect(rows, isNotEmpty);
-    expect(rows.single['name'], 'track_added');
+    final names = rows.map((r) => r['name']).toSet();
+    expect(names.contains('track_added'), isTrue);
+    expect(names.contains('track_downloaded'), isTrue);
+    expect(names.contains('track_source'), isTrue);
+  });
+
+  test('drive tracks can be ingested, marked downloaded, and filtered', () async {
+    await db.ingestDriveTracks('drive_folder_1', 'token_1', [
+      {
+        'id': 'gdrive:track1',
+        'uri': 'gdrive://track1',
+        'drive_id': 'track1',
+        'title': 'Cloud Song 1',
+        'artist': 'Cloud Artist',
+        'album': 'Cloud Album',
+      },
+      {
+        'id': 'gdrive:track2',
+        'uri': 'gdrive://track2',
+        'drive_id': 'track2',
+        'title': 'Cloud Song 2',
+        'artist': 'Cloud Artist',
+        'album': 'Cloud Album',
+      },
+    ]);
+
+    final allDrive = await db.songs(cloudOnly: true);
+    expect(allDrive.length, 2);
+    expect(allDrive.first.isCloud, isTrue);
+    expect(allDrive.first.isDownloaded, isFalse);
+
+    // Filter downloaded: initially only local files (0 local so far)
+    final downloadedBefore = await db.songs(downloaded: true);
+    expect(downloadedBefore, isEmpty);
+
+    // Mark track1 downloaded
+    await db.markDownloaded('gdrive:track1', '/path/to/downloaded/track1.mp3');
+    final downloadedAfter = await db.songs(downloaded: true);
+    expect(downloadedAfter.length, 1);
+    expect(downloadedAfter.single.id, 'gdrive:track1');
+    expect(downloadedAfter.single.isDownloaded, isTrue);
+    expect(downloadedAfter.single.downloadedPath, '/path/to/downloaded/track1.mp3');
+
+    // Remove download
+    await db.removeDownload('gdrive:track1');
+    final afterRemove = await db.songs(downloaded: true);
+    expect(afterRemove, isEmpty);
+    // Track still exists in cloud library
+    expect((await db.songs(cloudOnly: true)).length, 2);
   });
 
   test('playback position and current track scalar settings update correctly', () async {

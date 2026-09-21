@@ -18,7 +18,7 @@ class LibraryDatabase extends GeneratedDatabase {
   }
 
   @override
-  int get schemaVersion => 2;
+  int get schemaVersion => 3;
   @override
   Iterable<TableInfo<Table, Object?>> get allTables => const [];
   @override
@@ -36,6 +36,26 @@ class LibraryDatabase extends GeneratedDatabase {
           'CREATE INDEX IF NOT EXISTS track_added ON tracks(added_at DESC)',
         );
       }
+      if (from < 3) {
+        await customStatement(
+          "ALTER TABLE tracks ADD COLUMN source TEXT NOT NULL DEFAULT 'local'",
+        );
+        await customStatement(
+          'ALTER TABLE tracks ADD COLUMN drive_id TEXT',
+        );
+        await customStatement(
+          'ALTER TABLE tracks ADD COLUMN downloaded_path TEXT',
+        );
+        await customStatement(
+          'ALTER TABLE tracks ADD COLUMN is_downloaded INTEGER NOT NULL DEFAULT 0',
+        );
+        await customStatement(
+          'CREATE INDEX IF NOT EXISTS track_downloaded ON tracks(is_downloaded)',
+        );
+        await customStatement(
+          'CREATE INDEX IF NOT EXISTS track_source ON tracks(source)',
+        );
+      }
     },
     beforeOpen: (_) async {
       await customStatement('PRAGMA foreign_keys = ON');
@@ -49,7 +69,9 @@ class LibraryDatabase extends GeneratedDatabase {
       disc_number INTEGER NOT NULL DEFAULT 0, art_path TEXT, format TEXT NOT NULL DEFAULT '',
       modified INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0,
       favorite INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL,
-      available INTEGER NOT NULL DEFAULT 1, last_played INTEGER)''',
+      available INTEGER NOT NULL DEFAULT 1, last_played INTEGER,
+      source TEXT NOT NULL DEFAULT 'local', drive_id TEXT,
+      downloaded_path TEXT, is_downloaded INTEGER NOT NULL DEFAULT 0)''',
     '''CREATE TABLE folder_tracks(folder_uri TEXT NOT NULL REFERENCES folders(uri) ON DELETE CASCADE,
       track_id TEXT NOT NULL REFERENCES tracks(id), scan_token TEXT NOT NULL, uri TEXT NOT NULL,
       PRIMARY KEY(folder_uri, track_id))''',
@@ -58,6 +80,8 @@ class LibraryDatabase extends GeneratedDatabase {
     'CREATE INDEX track_album ON tracks(album, album_artist)',
     'CREATE INDEX track_recent ON tracks(last_played DESC)',
     'CREATE INDEX track_added ON tracks(added_at DESC)',
+    'CREATE INDEX track_downloaded ON tracks(is_downloaded)',
+    'CREATE INDEX track_source ON tracks(source)',
     'CREATE INDEX folder_track_id ON folder_tracks(track_id)',
     '''CREATE TABLE playlists(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)''',
     '''CREATE TABLE playlist_tracks(playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
@@ -109,8 +133,12 @@ class LibraryDatabase extends GeneratedDatabase {
       WHERE f.track_id=tracks.id AND d.error IS NULL LIMIT 1),uri),
     art_path=COALESCE((SELECT f.uri FROM folder_tracks f JOIN folders d ON d.uri=f.folder_uri
       WHERE f.track_id=tracks.id AND d.error IS NULL LIMIT 1),art_path), available =
-    CASE WHEN EXISTS(SELECT 1 FROM folder_tracks f JOIN folders d ON d.uri=f.folder_uri
-      WHERE f.track_id=tracks.id AND d.error IS NULL) THEN 1 ELSE 0 END''');
+    CASE
+      WHEN source='gdrive' THEN 1
+      WHEN EXISTS(SELECT 1 FROM folder_tracks f JOIN folders d ON d.uri=f.folder_uri
+        WHERE f.track_id=tracks.id AND d.error IS NULL) THEN 1
+      ELSE 0
+    END''');
   Future<List<Map<String, dynamic>>> fingerprints(String folder) => rows(
     '''SELECT t.id,t.modified,t.size
     FROM tracks t JOIN folder_tracks f ON f.track_id=t.id WHERE f.folder_uri=?''',
@@ -182,6 +210,8 @@ class LibraryDatabase extends GeneratedDatabase {
     SongSort sort = SongSort.title,
     bool favorites = false,
     bool recent = false,
+    bool downloaded = false,
+    bool cloudOnly = false,
     String? artist,
     String? album,
     String? albumArtist,
@@ -194,6 +224,8 @@ class LibraryDatabase extends GeneratedDatabase {
     if (playlist != null) args.add(playlist);
     if (favorites) sql += ' AND t.favorite=1';
     if (recent) sql += ' AND t.last_played IS NOT NULL';
+    if (downloaded) sql += " AND (t.source='local' OR t.is_downloaded=1)";
+    if (cloudOnly) sql += " AND t.source='gdrive'";
     if (artist != null) {
       sql += ' AND t.artist=?';
       args.add(artist);
@@ -313,5 +345,78 @@ class LibraryDatabase extends GeneratedDatabase {
       }
     }
     return ids.where(found.containsKey).map((id) => found[id]!).toList();
+  }
+
+  Future<void> markDownloaded(String trackId, String localPath) =>
+      customStatement(
+        'UPDATE tracks SET is_downloaded=1, downloaded_path=? WHERE id=?',
+        [localPath, trackId],
+      );
+
+  Future<void> removeDownload(String trackId) => customStatement(
+        'UPDATE tracks SET is_downloaded=0, downloaded_path=NULL WHERE id=?',
+        [trackId],
+      );
+
+  Future<void> ingestDriveTracks(
+    String folderId,
+    String token,
+    List<Map<String, dynamic>> batch,
+  ) async {
+    await transaction(() async {
+      for (final m in batch) {
+        final id = m['id'] as String;
+        final existing = await rows(
+          'SELECT is_downloaded, downloaded_path, favorite FROM tracks WHERE id=?',
+          [id],
+        );
+        final isDownloaded = existing.isNotEmpty && existing.first['is_downloaded'] == 1 ? 1 : 0;
+        final downloadedPath = existing.isNotEmpty ? existing.first['downloaded_path'] as String? : null;
+        final favorite = existing.isNotEmpty && existing.first['favorite'] == 1 ? 1 : 0;
+
+        await customStatement(
+          '''INSERT INTO tracks(id,uri,title,artist,album,album_artist,
+          duration_ms,track_number,disc_number,art_path,format,modified,size,added_at,
+          source,drive_id,downloaded_path,is_downloaded,favorite,available)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+          uri=excluded.uri,title=excluded.title,artist=excluded.artist,album=excluded.album,
+          album_artist=excluded.album_artist,duration_ms=excluded.duration_ms,
+          track_number=excluded.track_number,disc_number=excluded.disc_number,
+          art_path=excluded.art_path,format=excluded.format,modified=excluded.modified,
+          size=excluded.size,available=1''',
+          [
+            id,
+            m['uri'],
+            m['title'],
+            m['artist'] ?? 'Unknown artist',
+            m['album'] ?? 'Unknown album',
+            m['album_artist'] ?? '',
+            m['duration_ms'] ?? 0,
+            m['track_number'] ?? 0,
+            m['disc_number'] ?? 0,
+            m['art_path'],
+            m['format'] ?? '',
+            m['modified'] ?? 0,
+            m['size'] ?? 0,
+            DateTime.now().millisecondsSinceEpoch,
+            'gdrive',
+            m['drive_id'] ?? id,
+            downloadedPath,
+            isDownloaded,
+            favorite,
+            1,
+          ],
+        );
+      }
+    });
+  }
+
+  Future<void> clearDriveTracks() async {
+    await transaction(() async {
+      // If a track was downloaded, keep it, otherwise remove un-downloaded cloud tracks
+      await customStatement(
+        "DELETE FROM tracks WHERE source='gdrive' AND is_downloaded=0",
+      );
+    });
   }
 }

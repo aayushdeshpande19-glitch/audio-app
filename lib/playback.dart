@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:audio_service/audio_service.dart';
 import 'package:audio_session/audio_session.dart';
 import 'package:just_audio/just_audio.dart';
 
 import 'database.dart';
+import 'drive_stream_proxy.dart';
 import 'library.dart';
 import 'models.dart';
 
@@ -38,7 +40,7 @@ abstract interface class PlaybackController {
 class LocalAudioHandler extends BaseAudioHandler
     with QueueHandler, SeekHandler
     implements PlaybackController {
-  LocalAudioHandler(this.db) {
+  LocalAudioHandler(this.db, {this.proxy}) {
     _player.playbackEventStream.listen((_) => _broadcast());
     _player.currentIndexStream.listen((_) => _currentChanged());
     _player.playerStateStream.listen((_) {
@@ -56,6 +58,7 @@ class LocalAudioHandler extends BaseAudioHandler
     );
   }
   final LibraryDatabase db;
+  final DriveStreamProxy? proxy;
   final AudioPlayer _player = AudioPlayer(maxSkipsOnError: 6);
   final messages = StreamController<String>.broadcast();
   final List<Track> _tracks = [];
@@ -126,8 +129,15 @@ class LocalAudioHandler extends BaseAudioHandler
     queue.add(_tracks.sublist(start, end).map(_item).toList());
   }
 
-  AudioSource _source(Track t) =>
-      AudioSource.uri(Uri.parse(t.uri), tag: _item(t));
+  AudioSource _source(Track t) {
+    if (t.isDownloaded && t.downloadedPath != null && File(t.downloadedPath!).existsSync()) {
+      return AudioSource.uri(Uri.file(t.downloadedPath!), tag: _item(t));
+    }
+    if (t.source == 'gdrive' && proxy != null && t.driveId != null) {
+      return AudioSource.uri(Uri.parse(proxy!.urlFor(t.driveId!)), tag: _item(t));
+    }
+    return AudioSource.uri(Uri.parse(t.uri), tag: _item(t));
+  }
   @override
   Future<void> playTracks(List<Track> tracks, {int index = 0}) =>
       _serial(() async {

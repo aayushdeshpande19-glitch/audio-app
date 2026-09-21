@@ -9,6 +9,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 
 import 'database.dart';
+import 'download_manager.dart';
+import 'drive_service.dart';
+import 'drive_stream_proxy.dart';
 import 'library.dart';
 import 'models.dart';
 import 'playback.dart';
@@ -20,8 +23,25 @@ final dbProvider = Provider<LibraryDatabase>((_) => throw UnimplementedError());
 final audioProvider = Provider<LocalAudioHandler>(
   (_) => throw UnimplementedError(),
 );
+final driveServiceProvider = ChangeNotifierProvider<DriveService>(
+  (ref) => DriveService(),
+);
+final streamProxyProvider = Provider<DriveStreamProxy>(
+  (ref) => DriveStreamProxy(driveService: ref.watch(driveServiceProvider)),
+);
+final downloadManagerProvider = ChangeNotifierProvider<DownloadManager>(
+  (ref) => DownloadManager(
+    db: ref.watch(dbProvider),
+    driveService: ref.watch(driveServiceProvider),
+    onLibraryChanged: () => ref.read(libraryProvider).changed(),
+  ),
+);
 final libraryProvider = ChangeNotifierProvider<LibraryController>(
-  (ref) => LibraryController(ref.watch(dbProvider), AndroidLibraryAccess()),
+  (ref) => LibraryController(
+    ref.watch(dbProvider),
+    AndroidLibraryAccess(),
+    driveService: ref.watch(driveServiceProvider),
+  ),
 );
 final messengerKey = GlobalKey<ScaffoldMessengerState>();
 
@@ -87,8 +107,21 @@ class _BootstrapState extends State<Bootstrap> {
   Future<void> start() async {
     try {
       final db = await LibraryDatabase.open();
+      final driveService = DriveService();
+      await driveService.init();
+      final proxy = DriveStreamProxy(driveService: driveService);
+      await proxy.start();
+
+      VoidCallback? onLibChanged;
+      final downloadManager = DownloadManager(
+        db: db,
+        driveService: driveService,
+        onLibraryChanged: () => onLibChanged?.call(),
+      );
+      await downloadManager.init();
+
       final audio = await AudioService.init(
-        builder: () => LocalAudioHandler(db),
+        builder: () => LocalAudioHandler(db, proxy: proxy),
         config: const AudioServiceConfig(
           androidNotificationChannelId: 'app.localbeat.playback',
           androidNotificationChannelName: 'Music playback',
@@ -105,6 +138,12 @@ class _BootstrapState extends State<Bootstrap> {
             overrides: [
               dbProvider.overrideWithValue(db),
               audioProvider.overrideWithValue(audio),
+              driveServiceProvider.overrideWith((_) => driveService),
+              streamProxyProvider.overrideWithValue(proxy),
+              downloadManagerProvider.overrideWith((ref) {
+                onLibChanged = () => ref.read(libraryProvider).changed();
+                return downloadManager;
+              }),
             ],
             child: const LocalBeatApp(),
           ),
@@ -239,6 +278,14 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
         ),
         actions: [
           IconButton(
+            tooltip: 'Google Drive & Storage',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const GoogleDriveScreen()),
+            ),
+            icon: const Icon(Icons.cloud_outlined),
+          ),
+          IconButton(
             tooltip: 'Music folders',
             onPressed: () => Navigator.push(
               context,
@@ -343,17 +390,21 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                const Row(
+                                Row(
                                   children: [
                                     Icon(
-                                      Icons.offline_bolt_outlined,
+                                      ref.watch(driveServiceProvider).isSignedIn
+                                          ? Icons.cloud_done_outlined
+                                          : Icons.offline_bolt_outlined,
                                       size: 15,
                                       color: green,
                                     ),
-                                    SizedBox(width: 6),
+                                    const SizedBox(width: 6),
                                     Text(
-                                      'ALWAYS OFFLINE',
-                                      style: TextStyle(
+                                      ref.watch(driveServiceProvider).isSignedIn
+                                          ? 'CLOUD & OFFLINE'
+                                          : 'ALWAYS OFFLINE',
+                                      style: const TextStyle(
                                         color: green,
                                         fontSize: 10,
                                         fontWeight: FontWeight.w700,
@@ -444,38 +495,37 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
                         child: ListView(
                           scrollDirection: Axis.horizontal,
                           padding: const EdgeInsets.symmetric(horizontal: 20),
-                          children:
-                              [
-                                    'Songs',
-                                    'Albums',
-                                    'Artists',
-                                    'Playlists',
-                                    'Liked',
-                                    'Recent',
-                                  ]
-                                  .map(
-                                    (s) => Padding(
-                                      padding: const EdgeInsets.only(right: 8),
-                                      child: ChoiceChip(
-                                        label: Text(s),
-                                        selected: section == s,
-                                        showCheckmark: false,
-                                        onSelected: (_) =>
-                                            setState(() => section = s),
-                                        selectedColor: green,
-                                        labelStyle: TextStyle(
-                                          color: section == s
-                                              ? background
-                                              : Colors.white,
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w600,
-                                        ),
-                                        shape: const StadiumBorder(),
-                                        side: BorderSide.none,
-                                      ),
-                                    ),
-                                  )
-                                  .toList(),
+                          children: [
+                            for (final s in [
+                              'Songs',
+                              'Albums',
+                              'Artists',
+                              'Playlists',
+                              'Liked',
+                              'Recent',
+                              'Downloaded',
+                            ])
+                              Padding(
+                                padding: const EdgeInsets.only(right: 8),
+                                child: ChoiceChip(
+                                  label: Text(s),
+                                  selected: section == s,
+                                  showCheckmark: false,
+                                  onSelected: (_) =>
+                                      setState(() => section = s),
+                                  selectedColor: green,
+                                  labelStyle: TextStyle(
+                                    color: section == s
+                                        ? background
+                                        : Colors.white,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                  shape: const StadiumBorder(),
+                                  side: BorderSide.none,
+                                ),
+                              ),
+                          ],
                         ),
                       ),
                       Expanded(
@@ -488,16 +538,21 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen>
                               sort: sort,
                               favorites: section == 'Liked',
                               recent: section == 'Recent',
+                              downloaded: section == 'Downloaded',
                             ),
                             emptyTitle: section == 'Liked'
                                 ? 'Keep your favorites close'
                                 : section == 'Recent'
                                 ? 'Your next listen starts here'
+                                : section == 'Downloaded'
+                                ? 'No downloaded songs'
                                 : 'Make yourself at home',
                             emptyBody: section == 'Liked'
                                 ? 'Tap the heart on a song to save it here.'
                                 : section == 'Recent'
                                 ? 'Tracks you play will appear here.'
+                                : section == 'Downloaded'
+                                ? 'Download any song from Google Drive to listen offline.'
                                 : 'Choose a folder. We’ll take care of the music.',
                             showImport: section == 'Songs',
                           ),
@@ -740,42 +795,73 @@ class TrackTile extends ConsumerWidget {
   final VoidCallback onTap;
   final int? playlist;
   @override
-  Widget build(BuildContext context, WidgetRef ref) => ListTile(
-    contentPadding: const EdgeInsets.only(left: 20, right: 8),
-    leading: Cover(source: track.artPath),
-    title: Text(
-      track.title,
-      maxLines: 1,
-      overflow: TextOverflow.ellipsis,
-      style: TextStyle(
-        fontSize: 14,
-        fontWeight: FontWeight.w600,
-        color: track.available ? Colors.white : Colors.white38,
-      ),
-    ),
-    subtitle: Text(
-      track.available ? track.artist : 'Unavailable · ${track.artist}',
-      maxLines: 1,
-      overflow: TextOverflow.ellipsis,
-      style: const TextStyle(color: Colors.white54, fontSize: 12),
-    ),
-    trailing: Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        if (track.favorite) const Icon(Icons.favorite, color: green, size: 14),
-        IconButton(
-          tooltip: 'Song options',
-          onPressed: () => songActions(context, ref, track, playlist: playlist),
-          icon: const Icon(Icons.more_horiz, color: Colors.white60),
-        ),
-      ],
-    ),
-    onTap: track.available
-        ? onTap
-        : () => toast(
-            'This track is unavailable. Restore its folder access in Music folders.',
+  Widget build(BuildContext context, WidgetRef ref) {
+    final dlMgr = ref.watch(downloadManagerProvider);
+    final isDownloading = dlMgr.isDownloading(track.id);
+    final progress = dlMgr.getProgress(track.id);
+
+    return ListTile(
+      contentPadding: const EdgeInsets.only(left: 20, right: 8),
+      leading: Cover(source: track.artPath),
+      title: Row(
+        children: [
+          Expanded(
+            child: Text(
+              track.title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+                color: track.available ? Colors.white : Colors.white38,
+              ),
+            ),
           ),
-  );
+          if (track.isDownloaded)
+            const Padding(
+              padding: EdgeInsets.only(left: 6),
+              child: Icon(Icons.arrow_circle_down_rounded, color: green, size: 14),
+            )
+          else if (isDownloading)
+            Padding(
+              padding: const EdgeInsets.only(left: 6),
+              child: SizedBox(
+                width: 12,
+                height: 12,
+                child: CircularProgressIndicator(value: progress, strokeWidth: 2, color: green),
+              ),
+            )
+          else if (track.isCloud)
+            const Padding(
+              padding: EdgeInsets.only(left: 6),
+              child: Icon(Icons.cloud_outlined, color: Colors.white38, size: 14),
+            ),
+        ],
+      ),
+      subtitle: Text(
+        track.available ? track.artist : 'Unavailable · ${track.artist}',
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(color: Colors.white54, fontSize: 12),
+      ),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (track.favorite) const Icon(Icons.favorite, color: green, size: 14),
+          IconButton(
+            tooltip: 'Song options',
+            onPressed: () => songActions(context, ref, track, playlist: playlist),
+            icon: const Icon(Icons.more_horiz, color: Colors.white60),
+          ),
+        ],
+      ),
+      onTap: track.available
+          ? onTap
+          : () => toast(
+              'This track is unavailable. Restore its folder access in Music folders.',
+            ),
+    );
+  }
 }
 
 Future<String?> askName(
@@ -834,43 +920,58 @@ Future<void> songActions(
   final choice = await showModalBottomSheet<String>(
     context: context,
     showDragHandle: true,
+    isScrollControlled: true,
     builder: (c) => SafeArea(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          ListTile(
-            leading: Cover(source: track.artPath),
-            title: Text(
-              track.title,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-            subtitle: Text('${track.artist} · ${track.format}', maxLines: 1),
-          ),
-          const Divider(),
-          for (final entry in [
-            (
-              'favorite',
-              track.favorite ? 'Remove from liked songs' : 'Like song',
-              track.favorite ? Icons.favorite : Icons.favorite_border,
-            ),
-            ('next', 'Play next', Icons.playlist_play),
-            ('queue', 'Add to queue', Icons.queue_music),
-            ('playlist', 'Add to playlist', Icons.playlist_add),
-            if (playlist != null)
-              (
-                'remove',
-                'Remove from this playlist',
-                Icons.remove_circle_outline,
-              ),
-          ])
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
             ListTile(
-              leading: Icon(entry.$3),
-              title: Text(entry.$2),
-              onTap: () => Navigator.pop(c, entry.$1),
+              leading: Cover(source: track.artPath),
+              title: Text(
+                track.title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              subtitle: Text('${track.artist} · ${track.format}', maxLines: 1),
             ),
-          const SizedBox(height: 12),
-        ],
+            const Divider(),
+            for (final entry in [
+              (
+                'favorite',
+                track.favorite ? 'Remove from liked songs' : 'Like song',
+                track.favorite ? Icons.favorite : Icons.favorite_border,
+              ),
+              ('next', 'Play next', Icons.playlist_play),
+              ('queue', 'Add to queue', Icons.queue_music),
+              ('playlist', 'Add to playlist', Icons.playlist_add),
+              if (track.isCloud && !track.isDownloaded)
+                (
+                  'download',
+                  'Download to device',
+                  Icons.download_rounded,
+                ),
+              if (track.isCloud && track.isDownloaded)
+                (
+                  'remove_download',
+                  'Remove download',
+                  Icons.delete_outline_rounded,
+                ),
+              if (playlist != null)
+                (
+                  'remove',
+                  'Remove from this playlist',
+                  Icons.remove_circle_outline,
+                ),
+            ])
+              ListTile(
+                leading: Icon(entry.$3),
+                title: Text(entry.$2),
+                onTap: () => Navigator.pop(c, entry.$1),
+              ),
+            const SizedBox(height: 16),
+          ],
+        ),
       ),
     ),
   );
@@ -888,6 +989,12 @@ Future<void> songActions(
     case 'queue':
       await audio.enqueue(track);
       toast('Added to queue');
+    case 'download':
+      unawaited(ref.read(downloadManagerProvider).downloadTrack(track));
+      toast('Downloading "${track.title}"...');
+    case 'remove_download':
+      await ref.read(downloadManagerProvider).removeDownload(track);
+      toast('Download removed');
     case 'remove':
       await db.removeFromPlaylist(playlist!, track.id);
       lib.changed();
@@ -1419,6 +1526,40 @@ class NowPlayingScreen extends ConsumerWidget {
                             },
                           ),
                         ),
+                        FutureBuilder<List<Track>>(
+                          future: ref.read(dbProvider).tracksByIds([item.id]),
+                          builder: (context, snap) {
+                            final t = snap.data?.isNotEmpty == true ? snap.data!.first : null;
+                            if (t == null || !t.isCloud) return const SizedBox.shrink();
+                            final dl = ref.watch(downloadManagerProvider);
+                            if (dl.isDownloading(t.id)) {
+                              return const Padding(
+                                padding: EdgeInsets.all(12),
+                                child: SizedBox(
+                                  width: 20,
+                                  height: 20,
+                                  child: CircularProgressIndicator(strokeWidth: 2, color: green),
+                                ),
+                              );
+                            }
+                            return IconButton(
+                              tooltip: t.isDownloaded ? 'Remove download' : 'Download song',
+                              icon: Icon(
+                                t.isDownloaded ? Icons.arrow_circle_down_rounded : Icons.download_for_offline_outlined,
+                                color: t.isDownloaded ? green : Colors.white60,
+                              ),
+                              onPressed: () async {
+                                if (t.isDownloaded) {
+                                  await dl.removeDownload(t);
+                                  toast('Download removed');
+                                } else {
+                                  unawaited(dl.downloadTrack(t));
+                                  toast('Downloading "${t.title}"...');
+                                }
+                              },
+                            );
+                          },
+                        ),
                       ],
                     ),
                     SizedBox(height: gap),
@@ -1490,22 +1631,29 @@ class NowPlayingScreen extends ConsumerWidget {
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        const Row(
-                          children: [
-                            Icon(
-                              Icons.offline_bolt_outlined,
-                              color: green,
-                              size: 16,
-                            ),
-                            SizedBox(width: 6),
-                            Text(
-                              'Stored on your device',
-                              style: TextStyle(
-                                fontSize: 11,
-                                color: Colors.white54,
-                              ),
-                            ),
-                          ],
+                        FutureBuilder<List<Track>>(
+                          future: ref.read(dbProvider).tracksByIds([item.id]),
+                          builder: (context, snap) {
+                            final t = snap.data?.isNotEmpty == true ? snap.data!.first : null;
+                            final isStreaming = t?.isCloud == true && !t!.isDownloaded;
+                            return Row(
+                              children: [
+                                Icon(
+                                  isStreaming ? Icons.cloud_outlined : Icons.offline_bolt_outlined,
+                                  color: green,
+                                  size: 16,
+                                ),
+                                const SizedBox(width: 6),
+                                Text(
+                                  isStreaming ? 'Streaming from Google Drive' : 'Stored on your device',
+                                  style: const TextStyle(
+                                    fontSize: 11,
+                                    color: Colors.white54,
+                                  ),
+                                ),
+                              ],
+                            );
+                          },
                         ),
                         TextButton.icon(
                           onPressed: () => Navigator.push(
@@ -1790,6 +1938,375 @@ class FolderScreen extends ConsumerWidget {
             child: const Text('Open-source licenses'),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class GoogleDriveScreen extends ConsumerStatefulWidget {
+  const GoogleDriveScreen({super.key});
+  @override
+  ConsumerState<GoogleDriveScreen> createState() => _GoogleDriveScreenState();
+}
+
+class _GoogleDriveScreenState extends ConsumerState<GoogleDriveScreen> {
+  int? downloadedBytes;
+  int? cacheBytes;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadStorage();
+  }
+
+  Future<void> _loadStorage() async {
+    final dl = await ref.read(downloadManagerProvider).getDownloadedSizeBytes();
+    final cache = await ref.read(streamProxyProvider).getCacheSizeBytes();
+    if (mounted) {
+      setState(() {
+        downloadedBytes = dl;
+        cacheBytes = cache;
+      });
+    }
+  }
+
+  String _formatBytes(int? bytes) {
+    if (bytes == null) return '...';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final drive = ref.watch(driveServiceProvider);
+    final lib = ref.watch(libraryProvider);
+    final dlMgr = ref.watch(downloadManagerProvider);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Google Drive & Storage'),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(20),
+        children: [
+          const Text(
+            'Cloud Library & Offline',
+            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Connect Google Drive to stream your music on-demand and download your favorite songs for offline listening.',
+            style: TextStyle(color: Colors.white60, height: 1.5),
+          ),
+          const SizedBox(height: 20),
+
+          // Account Card
+          Card(
+            color: surface,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: drive.isSignedIn ? const Color(0xFF243B20) : const Color(0xFF2A2E2B),
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(
+                          drive.isSignedIn ? Icons.cloud_done : Icons.cloud_off,
+                          color: drive.isSignedIn ? green : Colors.white54,
+                          size: 24,
+                        ),
+                      ),
+                      const SizedBox(width: 14),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              drive.isSignedIn ? (drive.userDisplayName ?? 'Connected') : 'Google Drive Disconnected',
+                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                            ),
+                            Text(
+                              drive.isSignedIn ? (drive.userEmail ?? '') : 'Sign in to access your cloud music',
+                              style: const TextStyle(color: Colors.white54, fontSize: 12),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  if (!drive.isSignedIn) ...[
+                    FilledButton.icon(
+                      onPressed: () async {
+                        final ok = await drive.signIn();
+                        if (ok) {
+                          toast('Connected to Google Drive');
+                        } else {
+                          toast('Google Sign-In was cancelled or requires Google Play Services configuration.');
+                        }
+                      },
+                      icon: const Icon(Icons.login),
+                      label: const Text('Connect Google Drive'),
+                    ),
+                    const SizedBox(height: 10),
+                    OutlinedButton.icon(
+                      onPressed: () {
+                        drive.enableMockMode();
+                        toast('Demo Cloud Mode enabled for testing');
+                      },
+                      icon: const Icon(Icons.science_outlined),
+                      label: const Text('Enable Demo Cloud Mode'),
+                    ),
+                  ] else ...[
+                    Row(
+                      children: [
+                        if (drive.isMock)
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: const Color(0x33FFC107),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: const Text(
+                              'DEMO MODE',
+                              style: TextStyle(color: Colors.amber, fontSize: 11, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        const Spacer(),
+                        TextButton.icon(
+                          onPressed: () async {
+                            await drive.signOut();
+                            toast('Disconnected from Google Drive');
+                          },
+                          icon: const Icon(Icons.logout, color: Colors.redAccent, size: 18),
+                          label: const Text('Disconnect', style: TextStyle(color: Colors.redAccent)),
+                        ),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 20),
+
+          // Folder Selection & Sync Card (shown when connected)
+          if (drive.isSignedIn) ...[
+            Card(
+              color: surface,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Drive Music Folder',
+                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      lib.currentDriveFolder != null
+                          ? 'Selected folder: ${lib.currentDriveFolder}'
+                          : 'Choose a Google Drive folder containing your music collection.',
+                      style: const TextStyle(color: Colors.white60, fontSize: 13),
+                    ),
+                    const SizedBox(height: 16),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: FilledButton.tonalIcon(
+                            onPressed: lib.scanning
+                                ? null
+                                : () => _pickDriveFolder(context, drive, lib),
+                            icon: const Icon(Icons.folder_open),
+                            label: const Text('Choose Folder'),
+                          ),
+                        ),
+                        if (lib.currentDriveFolder != null) ...[
+                          const SizedBox(width: 10),
+                          IconButton.filledTonal(
+                            tooltip: 'Sync now',
+                            onPressed: lib.scanning
+                                ? null
+                                : () => lib.syncDriveFolder(
+                                      lib.currentDriveFolder!,
+                                      lib.currentDriveFolder!,
+                                    ),
+                            icon: const Icon(Icons.sync),
+                          ),
+                        ],
+                      ],
+                    ),
+                    if (lib.scanning)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 14),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const LinearProgressIndicator(),
+                            const SizedBox(height: 6),
+                            Text(
+                              'Indexing: ${lib.scanned} tracks found...',
+                              style: const TextStyle(fontSize: 12, color: green),
+                            ),
+                          ],
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 20),
+          ],
+
+          // Spotify-Style Storage Management Card
+          Card(
+            color: surface,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(Icons.pie_chart_outline, color: green, size: 20),
+                      SizedBox(width: 8),
+                      Text(
+                        'Storage & Downloads',
+                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+
+                  // Offline Downloads Row
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Offline Downloads', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+                    subtitle: Text(
+                      'Permanently saved songs: ${_formatBytes(downloadedBytes)}',
+                      style: const TextStyle(fontSize: 12, color: Colors.white54),
+                    ),
+                    trailing: TextButton(
+                      onPressed: (downloadedBytes ?? 0) > 0
+                          ? () async {
+                              final confirm = await showDialog<bool>(
+                                context: context,
+                                builder: (c) => AlertDialog(
+                                  title: const Text('Remove All Downloads?'),
+                                  content: const Text(
+                                    'This will delete downloaded offline audio files to free up space. Songs will remain in your cloud library for streaming.',
+                                  ),
+                                  actions: [
+                                    TextButton(
+                                      onPressed: () => Navigator.pop(c, false),
+                                      child: const Text('Cancel'),
+                                    ),
+                                    FilledButton(
+                                      onPressed: () => Navigator.pop(c, true),
+                                      child: const Text('Delete'),
+                                    ),
+                                  ],
+                                ),
+                              );
+                              if (confirm == true) {
+                                await dlMgr.deleteAllDownloads();
+                                await _loadStorage();
+                                toast('All downloaded files removed');
+                              }
+                            }
+                          : null,
+                      child: const Text('Delete all', style: TextStyle(color: Colors.redAccent, fontSize: 13)),
+                    ),
+                  ),
+                  const Divider(),
+
+                  // Streaming Cache Row
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Streaming Cache', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+                    subtitle: Text(
+                      'Temporary audio buffer: ${_formatBytes(cacheBytes)} (max 250 MB)',
+                      style: const TextStyle(fontSize: 12, color: Colors.white54),
+                    ),
+                    trailing: TextButton(
+                      onPressed: (cacheBytes ?? 0) > 0
+                          ? () async {
+                              await ref.read(streamProxyProvider).clearCache();
+                              await _loadStorage();
+                              toast('Streaming cache cleared');
+                            }
+                          : null,
+                      child: const Text('Clear cache', style: TextStyle(color: green, fontSize: 13)),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _pickDriveFolder(
+    BuildContext context,
+    DriveService drive,
+    LibraryController lib,
+  ) async {
+    showModalBottomSheet(
+      context: context,
+      showDragHandle: true,
+      builder: (c) => FutureBuilder<List<DriveFolder>>(
+        future: drive.listFolders(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Center(child: Padding(padding: EdgeInsets.all(32), child: CircularProgressIndicator()));
+          }
+          final folders = snapshot.data ?? [];
+          if (folders.isEmpty) {
+            return const Padding(
+              padding: EdgeInsets.all(24),
+              child: Text('No folders found in your Google Drive.'),
+            );
+          }
+          return SafeArea(
+            child: ListView(
+              shrinkWrap: true,
+              children: [
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(20, 8, 20, 16),
+                  child: Text(
+                    'Select Music Folder',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                ),
+                for (final folder in folders)
+                  ListTile(
+                    leading: const Icon(Icons.folder, color: green),
+                    title: Text(folder.name),
+                    onTap: () {
+                      Navigator.pop(c);
+                      lib.syncDriveFolder(folder.id, folder.name);
+                    },
+                  ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }
